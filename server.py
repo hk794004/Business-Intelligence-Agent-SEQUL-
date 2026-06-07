@@ -1,20 +1,40 @@
+import sys
+import io
 import streamlit as st
 import os
+import re
 import pyodbc
 import json
+import time
 import pandas as pd
 import plotly.express as px
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
+try:
+    if hasattr(sys.stdout, "buffer") and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "buffer") and sys.stderr.encoding.lower() != "utf-8":
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"]       = "1"   
+
 load_dotenv()
 
-MODELS_POOL = {
-    "fast": "openai/gpt-oss-120b",         
-    "advanced": "openai/gpt-oss-120b",     
-    "default": "openai/gpt-oss-120b"   
-}
+def ensure_str(val) -> str:
+    """Convert anything to a clean Unicode str — never raises."""
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    try:
+        return str(val)
+    except Exception:
+        return repr(val)
 
 @st.cache_resource
 def get_connection(driver, server, database, uid, pwd):
@@ -24,17 +44,19 @@ def get_connection(driver, server, database, uid, pwd):
         f"DATABASE={database};"
         f"UID={uid};"
         f"PWD={pwd};"
-        "TrustServerCertificate=yes;"
+        f"TrustServerCertificate=yes;"
+        f"MARS_Connection=yes;"
     )
     return pyodbc.connect(conn_str, autocommit=True)
+
 
 def fetch_schema(conn) -> dict:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT 
-            s.name AS schema_name, 
-            t.name AS table_name, 
-            c.name AS column_name, 
+        SELECT
+            s.name AS schema_name,
+            t.name AS table_name,
+            c.name AS column_name,
             tp.name AS data_type,
             c.is_nullable
         FROM sys.tables t
@@ -46,10 +68,11 @@ def fetch_schema(conn) -> dict:
     schema: dict = {}
     for row in cursor.fetchall():
         table_key = f"{row.schema_name}.{row.table_name}"
-        nullable = "NULL" if row.is_nullable else "NOT NULL"
-        col_def = f"{row.column_name} {row.data_type} {nullable}"
+        nullable  = "NULL" if row.is_nullable else "NOT NULL"
+        col_def   = f"{row.column_name} {row.data_type} {nullable}"
         schema.setdefault(table_key, []).append(col_def)
     return schema
+
 
 def schema_to_prompt_text(schema: dict, server_label: str) -> str:
     lines = [f"\n### {server_label} Tables\n"]
@@ -60,167 +83,184 @@ def schema_to_prompt_text(schema: dict, server_label: str) -> str:
         lines.append("")
     return "\n".join(lines)
 
-def rows_to_dicts(cursor) -> list[dict]:
+
+def rows_to_dicts(cursor) -> list:
     cols = [desc[0] for desc in cursor.description]
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
-SYSTEM_TEMPLATE = """
-You are an advanced, brain-driven SQL Server Intelligence Agent. You don't just write SQL; you deeply evaluate the user's business intent, structurally map out analytics fields, and dynamically plan multi-dimensional diagnostic needs.
 
-Strict Operational Rules:
-1. SECURITY: Only generate highly optimized, clean SQL 'SELECT' statements. Never allow DML/DDL.
-2. VOLUME: Always explicitly include 'TOP 100000' in your SQL query to pull sufficient raw records for pipeline background metrics and analytics calculations.
-3. ADAPTIVE BRAIN DECISION MAKING:
-   You must carefully inspect the schema and target columns to see if they support advanced analytical fields. Output a strictly valid JSON object.
-   - If the user asks for patterns over time, cycles, or future trends, set needs_timeseries to true.
-   - If the user is evaluating demographic metrics, customer types, regional breakdowns, or product tiers, dynamically identify this as a Segmentation opportunity and flag needs_chart and needs_analysis to true.
-   - If the query requires summary statistics, group totals, counts, percentages, or high cardinality categorical overviews, interpret it as a Descriptive or Forecasting opportunity, ensuring downstream visualization modules trigger.
-4. MODEL SELECTION: 
-   - Choose "fast" if the question is straightforward, plain counts, simple metadata lookups, or narrow single-table requests.
-   - Choose "advanced" if the business problem requires deep statistical forecasting logic, granular cohort segmentations, multi-table joins, or advanced analytical window functions.
-5. LANGUAGE RESPONSE INTELLIGENCE:
-   - Carefully read the user's linguistic style. Follow the exact script, style, and language used across the chat history.
+def inject_top_limit(sql: str, limit: int = 100000) -> str:
+    stripped = sql.strip()
+    if re.search(r'\bTOP\b', stripped, re.IGNORECASE):
+        return stripped
+    if re.match(r'^\s*WITH\b', stripped, re.IGNORECASE):
+        return stripped
+    return re.sub(r'\bSELECT\b', f'SELECT TOP {limit}', stripped, count=1, flags=re.IGNORECASE)
 
-Your output must be RAW JSON ONLY, matching this schema precisely (do not wrap in markdown code blocks or backticks):
+DECISION_TEMPLATE = """
+You are a highly advanced Senior SQL Business Intelligence Agent router. Your primary responsibility is to construct clean, optimized SQL 'SELECT' statements based strictly on the provided schema definitions.
+
+Strict Operational Instructions:
+1. SECURITY: You are strictly restricted to SQL 'SELECT' statements. Do NOT write or allow any DML/DDL queries (INSERT, UPDATE, DELETE, DROP, ALTER).
+
+2. OUT OF SCOPE & ZERO HALLUCINATION: If the user asks a question that cannot be resolved using the available tables/schema below, you MUST immediately set "out_of_scope": true. Do NOT hallucinate or use external knowledge.
+
+3. VISUALIZATION ROUTING:
+   - Set "needs_chart": true when ANY of these apply:
+       * User mentions rankings, top N, bottom N, comparisons by category/city/region/product
+       * User asks to "dikhao", "chart banao", "plot karo", "graph dikhao", "visualize"
+       * The result will have a categorical column + one or more numeric metric columns (multi-row result)
+       * The question involves sales, revenue, orders, customers grouped by any dimension
+   - Set "needs_chart": false ONLY for single-value scalar results
+
+4. ANALYSIS ROUTING:
+   - Set "needs_analysis": true when ANY of these apply:
+       * User asks for top/bottom rankings, comparisons, trends, performance review
+       * The result will have multiple rows with business metrics
+       * User uses words like "analysis", "insight", "compare", "best", "worst", "dikhao", "batao", "performance"
+   - Set "needs_analysis": false ONLY for single scalar lookups
+
+5. TIME SERIES ROUTING:
+   - Set "needs_timeseries": true when result contains date/year/month columns with numeric metrics
+
+6. MODEL SELECTION:
+   - "fast": single table, simple aggregates, basic counts
+   - "advanced": multi-table joins, window functions, complex aggregations
+
+Available database schema:
+{schema_text}
+
+Output ONLY a raw valid JSON object (no markdown, no backticks):
 {{
-  "sql": "YOUR_SQL_QUERY_HERE",
-  "needs_chart": true/false,
-  "needs_timeseries": true/false,
-  "needs_analysis": true/false,
+  "sql": "YOUR_OPTIMIZED_SQL_QUERY_HERE",
+  "needs_chart": true or false,
+  "needs_timeseries": true or false,
+  "needs_analysis": true or false,
   "recommended_model_tier": "fast" or "advanced",
   "out_of_scope": false
 }}
+"""
 
-Available database schema structures:
-{schema_text}
+ANALYSIS_TEMPLATE = """
+You are an expert Executive Business Consultant and Senior Data Scientist acting as a friendly, professional AI analytics companion. Your core mandate is to deliver an intelligent diagnostic evaluation derived strictly from the fetched dataset results.
+
+User's Input Question: {user_question}
+Mapped Dataset Metric Layout:
+{df_markdown}
+
+Analytical Framework:
+- DESCRIPTIVE & TREND VALUE: State exactly what the figures show clearly without repeating rigid templates.
+- SEGMENTATION & BENCHMARKS: Detail performance metrics, segment groupings, or performance standouts captured within the data.
+- OPERATIONAL FORECASTING: Outline forward-looking operational growth vectors or velocity drops if temporal elements are mapped.
+
+Strict Communication Rules:
+1. OUT OF SCOPE: If the data cannot logically answer the request, return exactly: "Out Of Scope Context Not Found in the Provided Document".
+2. LANGUAGE INTELLIGENCE: If the user writes in Roman Urdu (e.g. 'mujhe batayo', 'karo', 'dikhao'), output the entire analysis in that same Roman Urdu style. Keep technical metric names in English.
+
+Deliver your review concisely (max 3-4 precise bullet points).
 """
 
 def intelligent_agent_decision(user_question, schema_text, chat_history, api_key) -> dict:
-    llm = ChatGroq(api_key=api_key, model=MODELS_POOL["default"], temperature=0)
-    
-    messages = [SystemMessage(content=SYSTEM_TEMPLATE.format(schema_text=schema_text))]
-    
+    llm = ChatGroq(api_key=api_key, model=Models, temperature=0)
+    messages = [SystemMessage(content=DECISION_TEMPLATE.format(schema_text=schema_text))]
+
     for msg in chat_history:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            content_str = msg.get("content", "")
-            if msg.get("sql"):
-                content_str += f"\nGenerated SQL: {msg['sql']}"
-            messages.append(AIMessage(content=content_str))
-            
-    messages.append(HumanMessage(content=user_question))
-    
+        try:
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=ensure_str(msg.get("content", ""))))
+            elif msg["role"] == "assistant":
+                content_str = ensure_str(msg.get("content", ""))
+                if msg.get("sql"):
+                    content_str += f"\nGenerated SQL: {ensure_str(msg['sql'])}"
+                messages.append(AIMessage(content=content_str))
+        except Exception:
+            continue   
+
+    messages.append(HumanMessage(content=ensure_str(user_question)))
+
     response = llm.invoke(messages)
-    text = response.content.strip()
-    
+    text = ensure_str(response.content).strip()
+
     if text.startswith("```json"):
         text = text.split("```json")[1].split("```")[0].strip()
     elif text.startswith("```"):
         text = text.split("```")[1].split("```")[0].strip()
-        
+
     try:
         return json.loads(text)
     except Exception:
-        return {"sql": text, "needs_chart": True, "needs_timeseries": False, "needs_analysis": True, "recommended_model_tier": "advanced", "out_of_scope": False}
+        return {
+            "sql": text, "needs_chart": False, "needs_timeseries": False,
+            "needs_analysis": False, "recommended_model_tier": "fast", "out_of_scope": False
+        }
 
-def generate_advanced_analysis_from_summary(summary_text: str, api_key: str, model_name: str, language_instruction: str, chat_history: list) -> str:
-    llm = ChatGroq(api_key=api_key, model=model_name, temperature=0)
-    
-    history_context = ""
-    if chat_history:
-        history_context = "Previous Context / Conversations:\n" + "\n".join([f"{m['role']}: {m.get('content', '')}" for m in chat_history[-3:]])
-
-    prompt = f"""
-    You are an expert Data Scientist and Senior Data Analyst Agent. Analyze the Aggregated/Statistical Summary of the FULL dataset provided below.
-    
-    {history_context}
-
-    CRITICAL ANALYSIS FRAMEWORK:
-    - DESCRIPTIVE ANALYSIS: Summarize the current state, high-performing benchmarks, and key metric summaries.
-    - SEGMENTATION ANALYSIS: If there are grouped categorical variables, analyze top-performing customer cohorts, regions, or product segments.
-    - FORECASTING & TRENDS: If time elements exist, project forward-looking growth velocities, potential velocity drops, or future patterns.
-
-    Provide actionable data-driven conclusions and deliver exactly 1 sharp strategic recommendation based on your deep findings.
-    
-    LANGUAGE RULE:
-    {language_instruction}
-    
-    Summary Data:
-    {summary_text}
-    
-    Keep it strictly professional, clear, and highly customized to the data structure. Max 3-4 bullet points. Do not return generic text templates.
-    """
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return response.content.strip()
-
-def generate_advanced_analysis(df: pd.DataFrame, api_key: str, model_name: str, language_instruction: str, chat_history: list) -> str:
-    if df.empty: return "No data available."
-    llm = ChatGroq(api_key=api_key, model=model_name, temperature=0)
-    df_markdown = df.to_markdown()
-    
-    history_context = ""
-    if chat_history:
-        history_context = "Previous Context / Conversations:\n" + "\n".join([f"{m['role']}: {m.get('content', '')}" for m in chat_history[-3:]])
-
-    prompt = f"""
-    You are an expert Executive Business Consultant and Analytics Agent. Provide an intelligent diagnostic review based EXACTLY on these mapped metrics:
-    {df_markdown}
-    
-    {history_context}
-
-    CRITICAL ANALYTICAL FOCUS:
-    - Inspect the dimensions dynamically. If text-categories match, run a quick Segmentation performance analysis. If values span time intervals, outline a baseline Descriptive trend or operational Forecasting trajectory.
-    - State clearly what the figures show without any fixed pre-written phrases.
-    
-    LANGUAGE RULE:
-    {language_instruction}
-    
-    Keep it extremely precise and strategic. Max 3 actionable bullet points.
-    """
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return response.content.strip()
-
-def generate_chart_logic(df: pd.DataFrame, api_key: str, model_name: str, language_instruction: str) -> str:
+def generate_chart_logic(df, api_key, model_name, language_instruction, user_question) -> str:
     llm = ChatGroq(api_key=api_key, model=model_name, temperature=0)
     columns_info = df.dtypes.to_dict()
+    total_rows   = len(df)
+
     prompt = f"""
-    Based on these pandas DataFrame columns: {columns_info}
-    Provide ONLY valid Python code using Plotly Express (px) to visualize the data.
-    
-    CRITICAL INSTRUCTIONS:
-    - The DataFrame is already available as 'df'.
-    - Assign the final plotly figure to a variable named 'fig'.
-    - Never skip chart generation or write comments instead of code. You MUST generate an active chart layout.
-    - If there are columns representing categories, years, or IDs (e.g., 'CalendarYear', 'Year', 'ID'), treat them as categorical strings so Plotly renders proper discrete elements.
-    
-    MULTIPLE METRICS & GROUPING RULE:
-    - If there are MULTIPLE numeric metric columns alongside a time/categorical column, you MUST pass both metrics as a list to the y-axis parameter to create a grouped/side-by-side bar chart, or use `barmode='group'`. 
-    
-    DATA LABELS INSIDE RULE (STRICT MANDATE):
-    - You MUST display data value labels clearly inside or directly on top of the visual elements (bars/lines/points). 
-    - For bar charts (`px.bar`), pass the metric column name to the `text` parameter during creation, and then immediately call `fig.update_traces(texttemplate='%{{text:,.0f}}', textposition='inside')` to ensure numeric markings are perfectly readable.
-    
-    SORTING & CLEAN VISUALIZATION RULE:
-    - If any column represents months, you MUST sort the DataFrame chronologically by month before passing it to px.
-    - For non-numeric text/categorical columns, you MUST sort the DataFrame alphabetically (A to Z) using `df.sort_values()`.
-    - Isolate exactly the TOP 10 rows based on the primary numeric column to maintain a clean view if clutter occurs.
-    
-    LANGUAGE RULE FOR CHART TITLE:
-    {language_instruction}
-    
-    DYNAMIC TITLE RULE:
-    - You MUST create a contextually dynamic title for the chart based on the selected columns. Adhere strictly to the LANGUAGE RULE above when creating the title string. Do NOT use generic or static English text for the title.
-    
-    - Output ONLY pure executable Python code. No markdown formatting, no backticks, no text explanations.
-    """
+You are a senior data visualization engineer. Generate a single, clean Plotly Express chart.
+
+USER'S ORIGINAL QUESTION (source of truth):
+\"\"\"{user_question}\"\"\"
+
+DataFrame info:
+- Columns & dtypes: {columns_info}
+- Total rows available: {total_rows}
+
+The DataFrame is already available as 'df'. Assign the final figure to 'fig'.
+
+CRITICAL RULE 1 — ROW COUNT:
+Extract the EXACT number requested (e.g. "top 20", "top 5").
+Use df.head(N) or df.tail(N). If no number stated, use ALL rows.
+
+CRITICAL RULE 2 — CHART TYPE:
+- Rankings/comparisons → horizontal bar (px.bar orientation='h')
+- Time trends → line chart (px.line)
+- Proportions → pie chart (px.pie)
+- Correlation → px.scatter
+- Multiple metrics → grouped bar (barmode='group')
+
+CRITICAL RULE 3 — SORTING:
+- Ranking charts: sort descending by primary metric BEFORE slicing.
+- Time series: sort ascending by date.
+
+CRITICAL RULE 4 — DATA LABELS:
+Always show data labels. For px.bar use text= then:
+fig.update_traces(texttemplate='%{{text:,.0f}}', textposition='inside')
+
+CRITICAL RULE 5 — YEAR/ID COLUMNS:
+Cast year/id/calendar columns to str for discrete rendering.
+
+CRITICAL RULE 6 — MULTIPLE METRICS:
+If multiple numeric columns exist, pass as list to y= with barmode='group'.
+
+LANGUAGE RULE FOR CHART TITLE:
+{language_instruction}
+Create a dynamic title from the user's question. Follow the language rule strictly.
+
+OUTPUT RULE:
+Output ONLY pure executable Python code — no markdown, no backticks, no comments.
+"""
+
     response = llm.invoke([HumanMessage(content=prompt)])
-    code = response.content.strip()
+    code = ensure_str(response.content).strip()
     if code.startswith("```python"):
         code = code.split("```python")[1].split("```")[0].strip()
     elif code.startswith("```"):
         code = code.split("```")[1].split("```")[0].strip()
     return code
+
+def type_text(placeholder, text: str, delay: float = 0.018):
+    """Stream text word-by-word with a blinking cursor."""
+    words   = ensure_str(text).split(" ")
+    current = ""
+    for word in words:
+        current += word + " "
+        placeholder.markdown(current + "▌")
+        time.sleep(delay)
+    placeholder.markdown(current.strip())
 
 st.set_page_config(page_title="SQL AI Agent", page_icon="🤖", layout="wide")
 st.title("🤖 AI-Powered Adaptive SQL Intelligence Agent")
@@ -228,28 +268,41 @@ st.caption("An intelligent agent that dynamically decides whether to write queri
 
 st.divider()
 
-if "schema" not in st.session_state: st.session_state.schema = {}
+if "schema"      not in st.session_state: st.session_state.schema      = {}
 if "schema_text" not in st.session_state: st.session_state.schema_text = ""
-if "messages" not in st.session_state: st.session_state.messages = []
+if "messages"    not in st.session_state: st.session_state.messages    = []
 
 with st.sidebar:
     st.header("⚙️ Control")
+
     groq_api_key = st.text_input("Enter Groq API Key", type="password")
-    
     if groq_api_key:
-        st.success("🔗 GROQ API KEY Connected...")
-    
+        st.success("🔗 GROQ API KEY is Connected & Running...")
+    else:
+        st.error("GROQ API KEY is Missing...")
+        st.stop()
+
+    Models = st.selectbox(
+        "Select Models",
+        [
+            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "meta-llama/llama-4-scout-17b-16e-instruct"
+        ]
+    )
+
     st.divider()
     st.subheader("🗄️ SQL Server Connection")
-    
-    db_driver = st.text_input("DRIVER", value=os.getenv("DRIVER", "{ODBC Driver 17 for SQL Server}"))
-    db_server = st.text_input("SERVER", value=os.getenv("SERVER", ""))
-    db_database = st.text_input("DATABASE", value=os.getenv("DATABASE", ""))
-    db_uid = st.text_input("UID (User ID)", value=os.getenv("UID", ""))
-    db_pwd = st.text_input("PWD (Password)", type="password", value=os.getenv("PWD", ""))
-    
+
+    db_driver   = st.text_input("DRIVER",         value=os.getenv("DRIVER",   "{ODBC Driver 17 for SQL Server}"))
+    db_server   = st.text_input("SERVER",         value=os.getenv("SERVER",   ""))
+    db_database = st.text_input("DATABASE",       value=os.getenv("DATABASE", ""))
+    db_uid      = st.text_input("UID (User ID)",  value=os.getenv("UID",      ""))
+    db_pwd      = st.text_input("PWD (Password)", type="password", value=os.getenv("PWD", ""))
+
     st.divider()
-    
+
     if st.button("🔄 Load Schema", use_container_width=True):
         if not groq_api_key:
             st.error("🔑 Please enter your Groq API Key...")
@@ -259,8 +312,10 @@ with st.sidebar:
             with st.spinner("Fetching schema..."):
                 try:
                     conn = get_connection(db_driver, db_server, db_database, db_uid, db_pwd)
-                    st.session_state.schema = fetch_schema(conn)
-                    st.session_state.schema_text = schema_to_prompt_text(st.session_state.schema, db_database)
+                    st.session_state.schema      = fetch_schema(conn)
+                    st.session_state.schema_text = schema_to_prompt_text(
+                        st.session_state.schema, db_database
+                    )
                     st.success(f"{len(st.session_state.schema)} Tables Fetched")
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -268,68 +323,75 @@ with st.sidebar:
     if st.session_state.schema:
         st.divider()
         st.subheader("📋 Database Schema Details")
-        
         for table_name, columns in st.session_state.schema.items():
             with st.expander(f"📁 {table_name}", expanded=False):
                 st.markdown("**Columns & Types:**")
                 for col in columns:
                     st.caption(f"🔹 {col}")
 
-def render_assistant_elements(message):
-    if "info" in message: 
+def render_assistant_elements(message, animate: bool = False):
+    if "info" in message:
         st.info(message["info"])
         return
 
     if "sql" in message and message["sql"]:
-        with st.expander("📄 View Generated SQL Query", expanded=False):
-            display_sql = message["sql"].replace("TOP 100000", "TOP 100").replace("top 100000", "TOP 100")
+        with st.expander("📄 Generated SQL Query", expanded=False):
+            display_sql = re.sub(
+                r'\bTOP\s+100000\b', 'TOP 100', message["sql"], flags=re.IGNORECASE
+            )
             st.code(display_sql, language="sql")
-            
+
     if "df" in message and message["df"] is not None:
         df = message["df"]
-        st.markdown("***💡 Data Results (Showing Top 100 Rows)***")
+        st.markdown("***💡 Data Tables Results***")
         st.dataframe(df.head(100), use_container_width=True)
-        
+
         if message.get("show_ts") and message.get("has_ts"):
             try:
-                df_ts = df.copy()
+                df_ts    = df.copy()
                 date_col = message["date_col"]
-                val_col = message["val_col"]
-                
+                val_col  = message["val_col"]
                 if df_ts[date_col].dtype in ['int64', 'float64']:
                     df_ts[date_col] = df_ts[date_col].astype(str)
-                    
                 df_ts[date_col] = pd.to_datetime(df_ts[date_col], errors='coerce')
                 df_ts = df_ts.dropna(subset=[date_col]).sort_values(by=date_col)
-                
-                fig_ts = px.line(df_ts, x=date_col, y=val_col, title="📈 Time Series Trend & Moving Average", markers=True)
-                fig_ts.add_scatter(x=df_ts[date_col], y=df_ts[val_col].rolling(window=2, min_periods=1).mean(), name="Moving Avg")
+                fig_ts = px.line(df_ts, x=date_col, y=val_col,
+                                 title="📈 Time Series Trend & Moving Average", markers=True)
+                fig_ts.add_scatter(
+                    x=df_ts[date_col],
+                    y=df_ts[val_col].rolling(window=2, min_periods=1).mean(),
+                    name="Moving Avg"
+                )
                 st.plotly_chart(fig_ts, use_container_width=True)
-            except: pass
+            except Exception:
+                pass
 
         if message.get("show_chart") and message.get("chart_code"):
             try:
                 df_chart = df.copy()
                 for col in df_chart.columns:
-                    if 'year' in col.lower() or 'id' in col.lower() or 'calendar' in col.lower():
+                    if any(k in col.lower() for k in ('year', 'id', 'calendar')):
                         df_chart[col] = df_chart[col].astype(str)
-                        
                 ldict = {"df": df_chart, "px": px}
                 exec(message["chart_code"], {}, ldict)
                 st.plotly_chart(ldict["fig"], use_container_width=True)
-            except: pass
-            
+            except Exception:
+                pass
+
     if message.get("show_analysis") and message.get("analysis"):
         st.markdown("***🚀 Strategic Insights (Full Dataset Analysis)***")
-        st.markdown(message["analysis"])
+        if animate:
+            placeholder = st.empty()
+            type_text(placeholder, message["analysis"])
+        else:
+            st.markdown(message["analysis"])
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        if "content" in message: 
+        if "content" in message:
             st.write(message["content"])
         if message["role"] == "assistant":
-            render_assistant_elements(message)
-
+            render_assistant_elements(message, animate=False)
 
 user_query = st.chat_input("💬 Ask a question...")
 
@@ -340,80 +402,96 @@ if user_query:
         st.warning("⚠️ Please Load The Schema First...")
     else:
         current_history = list(st.session_state.messages)
-        
+
         st.session_state.messages.append({"role": "user", "content": user_query})
-        with st.chat_message("user"): 
+        with st.chat_message("user"):
             st.write(user_query)
 
         with st.chat_message("assistant"):
             msg_data = {
-                "role": "assistant", "content": f"Processed query: {user_query}", "sql": "", "df": None, "analysis": "", "chart_code": "", 
+                "role": "assistant", "content": f"Processed query: {user_query}",
+                "sql": "", "df": None, "analysis": "", "chart_code": "",
                 "has_ts": False, "show_chart": False, "show_ts": False, "show_analysis": False
             }
-            
+
             try:
                 language_instruction = (
-                    "Strict Rule: Always analyze the user's input language from the query and continuous conversation history. "
-                    "If they write in Urdu script or Roman Urdu (English text representing Urdu words like 'karo', 'dikhao', 'mujhe'), "
-                    "you MUST write the final strategic insights, summary text, chart titles, and bullet points in Urdu / Roman Urdu format. "
-                    "Keep pure technical jargon and dimensional column headers in English (e.g., Orders, Customers, Growth, Trend) "
-                    "but write all structural prose and connecting explanations in Urdu / Roman Urdu so it perfectly aligns with their input style. "
-                    "If the query is purely in English, write the response entirely in English."
+                    "Strict Rule: Always analyze the user's input language style from the query. "
+                    "If they write in Roman Urdu (e.g. 'karo', 'dikhao', 'mujhe'), "
+                    "write chart titles and analysis in that same Roman Urdu style. "
+                    "Keep technical metric names in English."
                 )
-                
-                with st.status("🧠 thinking...", expanded=False) as status:
-                    decision = intelligent_agent_decision(user_query, st.session_state.schema_text, current_history, groq_api_key)
-                    
+
+                with st.status("🧠 Agent thinking...", expanded=False) as status:
+                    decision = intelligent_agent_decision(
+                        user_query,
+                        st.session_state.schema_text,
+                        current_history,
+                        groq_api_key
+                    )
+
                     if decision.get("out_of_scope"):
-                        status.update(label="Out of Scope information not Provided in the Schema / Table", state="error")
-                        err_text = "Out of scope: Information not found in the provided tables / schema."
-                        msg_data["info"] = err_text
+                        status.update(label="Out of Scope — Context Not Found", state="error")
+                        msg_data["info"] = "Out Of Scope Context Not Found in the Provided Document"
                     else:
                         msg_data["sql"] = decision.get("sql", "")
-                        
-                        tier = decision.get("recommended_model_tier", "fast")
-                        active_model = MODELS_POOL.get(tier, MODELS_POOL["default"])
-                        
-                        conn = get_connection(db_driver, db_server, db_database, db_uid, db_pwd)
+                        active_model    = Models
+
+                        conn   = get_connection(db_driver, db_server, db_database, db_uid, db_pwd)
                         cursor = conn.cursor()
-                        cursor.execute(msg_data["sql"])
+
+                        executed_sql = inject_top_limit(msg_data["sql"], limit=100000)
+                        cursor.execute(executed_sql)
                         data = rows_to_dicts(cursor)
-                        
+
                         if data:
                             df = pd.DataFrame(data)
                             msg_data["df"] = df
-                            
-                            has_enough_data = len(df) > 1 and len(df.columns) > 1
-                            
-                            msg_data["show_chart"] = decision.get("needs_chart", False) or has_enough_data
-                            msg_data["show_ts"] = decision.get("needs_timeseries", False)
-                            msg_data["show_analysis"] = decision.get("needs_analysis", False) or has_enough_data
-                            
+
+                            is_single_value = (df.shape == (1, 1))
+
+                            if is_single_value:
+                                msg_data["show_chart"]    = False
+                                msg_data["show_ts"]       = False
+                                msg_data["show_analysis"] = False
+                            else:
+                                msg_data["show_chart"]    = decision.get("needs_chart",      False)
+                                msg_data["show_ts"]       = decision.get("needs_timeseries", False)
+                                msg_data["show_analysis"] = decision.get("needs_analysis",   False)
+
                             if msg_data["show_ts"]:
-                                date_cols = [c for c in df.columns if 'date' in c.lower() or 'year' in c.lower() or 'month' in c.lower()]
-                                numeric_cols = [c for c in df.columns if df[c].dtype in ['float64', 'int64']]
+                                date_cols    = [c for c in df.columns if any(k in c.lower() for k in ('date','year','month'))]
+                                numeric_cols = [c for c in df.columns if df[c].dtype in ['float64','int64']]
                                 if date_cols and numeric_cols:
-                                    msg_data["has_ts"] = True
+                                    msg_data["has_ts"]   = True
                                     msg_data["date_col"] = date_cols[0]
-                                    msg_data["val_col"] = numeric_cols[0]
+                                    msg_data["val_col"]  = numeric_cols[0]
 
                             if msg_data["show_chart"]:
-                                chart_code = generate_chart_logic(df, groq_api_key, active_model, language_instruction)
-                                msg_data["chart_code"] = chart_code
+                                msg_data["chart_code"] = generate_chart_logic(
+                                    df, groq_api_key, active_model,
+                                    language_instruction, user_query
+                                )
 
                             if msg_data["show_analysis"]:
-                                numeric_cols = [c for c in df.columns if df[c].dtype in ['float64', 'int64']]
-                                if len(df) > 200:
-                                    summary_str = f"Total Records Found: {len(df)}\n" + df.describe().to_markdown() + "\n\n"
-                                    cat_cols = [c for c in df.columns if df[c].dtype == 'object']
-                                    if cat_cols and numeric_cols:
-                                        summary_str += df.groupby(cat_cols[0])[numeric_cols[0]].sum().nlargest(15).to_markdown()
-                                    analysis = generate_advanced_analysis_from_summary(summary_str, groq_api_key, active_model, language_instruction, current_history)
-                                else:
-                                    analysis = generate_advanced_analysis(df, groq_api_key, active_model, language_instruction, current_history)
-                                msg_data["analysis"] = analysis
+                                df_markdown = (
+                                    df.to_markdown()
+                                    if len(df) <= 200
+                                    else df.describe().to_markdown()
+                                )
+                                analysis_prompt = ANALYSIS_TEMPLATE.format(
+                                    user_question=user_query,
+                                    df_markdown=df_markdown
+                                )
+                                analysis_llm = ChatGroq(
+                                    api_key=groq_api_key, model=active_model, temperature=0
+                                )
+                                response = analysis_llm.invoke(
+                                    [HumanMessage(content=analysis_prompt)]
+                                )
+                                msg_data["analysis"] = ensure_str(response.content).strip()
 
-                render_assistant_elements(msg_data)
+                render_assistant_elements(msg_data, animate=True)
                 st.session_state.messages.append(msg_data)
 
             except Exception as e:
